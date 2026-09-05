@@ -1,5 +1,11 @@
 # GO RUNCARNATION
 
+![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat-square&logo=go&logoColor=white)
+![GitHub License](https://img.shields.io/github/license/quadrans-muralis/runcarnation?style=flat-square&color=blue)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey?style=flat-square)
+![Build Status](https://img.shields.io/github/actions/workflow/status/quadrans-muralis/runcarnation/ci.yml?branch=main&style=flat-square&logo=github)
+![Last Commit](https://img.shields.io/github/last-commit/quadrans-muralis/runcarnation?style=flat-square&color=blue)
+
 **「動かしっぱなしのアプリが、リモートの更新を検知した瞬間に生まれ変わる。」**
 
 GO RUNCARNATION は、Gitリポジトリの状態を監視し、GitHub 上に新しいコミットが来たら自動で **pull → 再ビルド → 再起動** までやってくれるCLIツールです。名前の由来は `run`（実行）と `reincarnation`（生まれ変わり）。開発サーバーやBotなど「常に最新のコードで動かしっぱなしにしたいプロセス」を、`git pull` して手動で再起動する手間から解放します。

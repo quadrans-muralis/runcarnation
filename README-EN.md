@@ -1,5 +1,11 @@
 # GO RUNCARNATION
 
+![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat-square&logo=go&logoColor=white)
+![GitHub License](https://img.shields.io/github/license/quadrans-muralis/runcarnation?style=flat-square&color=blue)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey?style=flat-square)
+![Build Status](https://img.shields.io/github/actions/workflow/status/quadrans-muralis/runcarnation/ci.yml?branch=main&style=flat-square&logo=github)
+![Last Commit](https://img.shields.io/github/last-commit/quadrans-muralis/runcarnation?style=flat-square&color=blue)
+
 **"Always-on apps, reborn the moment a remote update is detected."**
 
 GO RUNCARNATION is a CLI tool that monitors the state of a Git repository. When a new commit arrives on GitHub, it automatically executes **pull → rebuild → restart**. The name originates from combining `run` and `reincarnation`. It frees you from the manual effort of running `git pull` and restarting development servers, bots, or any always-on background processes.

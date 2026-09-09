@@ -3,14 +3,20 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"html"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 )
 
@@ -20,6 +26,12 @@ const pollInterval = 5 * time.Second
 
 // logRetention is how long a log file is kept before cleanOldLogs removes it.
 const logRetention = 14 * 24 * time.Hour
+
+// webListenAddr is where the embedded web console listens.
+const webListenAddr = "0.0.0.0:8520"
+
+// webBrowserURL is what gets opened in the user's default browser on startup.
+const webBrowserURL = "http://localhost:8520/"
 
 type Language string
 
@@ -1167,37 +1179,19 @@ func runNonInteractive(args []string) int {
 	}
 }
 
-func main() {
-
-	cleanupLogging, logErr := setupLogging()
-	if logErr != nil {
-		fmt.Println("[WARN] Logging could not be set up:", logErr)
-		cleanupLogging = func() {}
-	}
-
-	if len(os.Args) > 1 {
-		code := runNonInteractive(os.Args[1:])
-		cleanupLogging()
-		os.Exit(code)
-	}
-
-	defer cleanupLogging()
-
-	banner()
-
-	fmt.Println("  Welcome, operator.")
-	fmt.Println("  Type 'help' to access the command center.")
-	fmt.Println()
-
+// runShellSession runs the interactive command loop. It reads from os.Stdin
+// and writes to os.Stdout/os.Stderr, whatever those currently point to - this
+// lets the same logic power both the local terminal and the web console,
+// which temporarily redirect these to pipes for the duration of a session.
+func runShellSession() {
 	scanner := bufio.NewScanner(os.Stdin)
 
-MainLoop:
+ShellLoop:
 	for {
-
 		fmt.Print("GO RUNCARNATION> ")
 
 		if !scanner.Scan() {
-			break MainLoop
+			break ShellLoop
 		}
 
 		input := normalizeCommand(strings.TrimSpace(scanner.Text()))
@@ -1211,12 +1205,12 @@ MainLoop:
 			path, eof := readRepoPath(scanner)
 
 			if eof {
-				break MainLoop
+				break ShellLoop
 			}
 
 			if path == "" {
 				fmt.Println("[ERROR]", t("err_path_empty"))
-				continue MainLoop
+				continue ShellLoop
 			}
 
 			switch input {
@@ -1276,4 +1270,454 @@ MainLoop:
 	if err := scanner.Err(); err != nil {
 		fmt.Println("[ERROR] Input error:", err)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Web console
+//
+// This exposes the exact same interactive shell (runShellSession) through a
+// browser-based terminal served at http://0.0.0.0:8520/. Output is streamed
+// to the browser over Server-Sent Events; keystrokes typed into the page are
+// POSTed back and fed into the shell's stdin.
+//
+// The shell session's lifetime is independent of any single HTTP connection:
+// if a browser tab is closed, the network drops, or the page is reloaded,
+// the underlying shell (and any command it's running, e.g. "runcarnation")
+// keeps going untouched. Reconnecting (or opening a new tab) re-attaches to
+// the same running session and replays what was missed. The ONLY way the
+// session itself ends is the operator explicitly typing "exit".
+// ---------------------------------------------------------------------------
+
+// outputHub fans a session's output out to any number of currently attached
+// SSE viewers, and keeps a bounded backlog so a viewer that (re)connects
+// mid-session can catch up on what it missed.
+type outputHub struct {
+	mu          sync.Mutex
+	subscribers map[chan []byte]struct{}
+	history     []byte
+}
+
+const outputHistoryLimit = 2 << 20 // 2 MiB of scrollback retained for reconnects
+
+func newOutputHub() *outputHub {
+	return &outputHub{subscribers: make(map[chan []byte]struct{})}
+}
+
+// subscribe registers a new viewer and returns a channel of future output
+// plus a snapshot of everything already produced, so the caller can replay
+// it before switching to live updates.
+func (h *outputHub) subscribe() (ch chan []byte, replay []byte) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	ch = make(chan []byte, 256)
+	h.subscribers[ch] = struct{}{}
+	replay = append([]byte(nil), h.history...)
+	return ch, replay
+}
+
+func (h *outputHub) unsubscribe(ch chan []byte) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if _, ok := h.subscribers[ch]; ok {
+		delete(h.subscribers, ch)
+		close(ch)
+	}
+}
+
+func (h *outputHub) publish(data []byte) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.history = append(h.history, data...)
+	if len(h.history) > outputHistoryLimit {
+		h.history = h.history[len(h.history)-outputHistoryLimit:]
+	}
+
+	for ch := range h.subscribers {
+		select {
+		case ch <- data:
+		default:
+			// A slow/stuck viewer shouldn't be able to stall the shell;
+			// it will simply catch up via history on its next reconnect.
+		}
+	}
+}
+
+// webSession represents one live run of runShellSession(), independent of
+// how many (or how few) browser tabs are currently watching it.
+type webSession struct {
+	hub    *outputHub
+	stdinW *os.File
+	done   chan struct{} // closed once the shell exits (i.e. "exit" was typed)
+}
+
+var (
+	sessionMu      sync.Mutex
+	currentSession *webSession
+)
+
+// getOrCreateSession returns the currently running session, starting a new
+// one (with a fresh banner) only if none is currently alive.
+func getOrCreateSession() (*webSession, error) {
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
+
+	if currentSession != nil {
+		return currentSession, nil
+	}
+
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create stdin pipe: %w", err)
+	}
+
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		stdinR.Close()
+		stdinW.Close()
+		return nil, fmt.Errorf("failed to create stdout pipe: %w", err)
+	}
+
+	origStdin, origStdout, origStderr := os.Stdin, os.Stdout, os.Stderr
+	os.Stdin = stdinR
+	os.Stdout = outW
+	os.Stderr = outW
+
+	s := &webSession{
+		hub:    newOutputHub(),
+		stdinW: stdinW,
+		done:   make(chan struct{}),
+	}
+	currentSession = s
+
+	// Runs the actual interactive shell.
+	go func() {
+		banner()
+		fmt.Println("  Welcome, operator. (Web Console)")
+		fmt.Println("  Type 'help' to access the command center.")
+		fmt.Println("  Note: closing this tab or losing connection will NOT stop the session.")
+		fmt.Println("        Only the 'exit' command shuts it down.")
+		fmt.Println()
+		runShellSession()
+
+		// The shell only returns here once "exit" was typed (or stdin
+		// itself was closed, which nothing in the web path ever does).
+		os.Stdin, os.Stdout, os.Stderr = origStdin, origStdout, origStderr
+		_ = outW.Close()
+	}()
+
+	// Continuously drains the shell's output into the hub, regardless of
+	// whether any browser tab is currently attached to watch it.
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, readErr := outR.Read(buf)
+			if n > 0 {
+				chunk := make([]byte, n)
+				copy(chunk, buf[:n])
+				s.hub.publish(chunk)
+			}
+			if readErr != nil {
+				break
+			}
+		}
+
+		close(s.done)
+
+		sessionMu.Lock()
+		if currentSession == s {
+			currentSession = nil
+		}
+		sessionMu.Unlock()
+
+		_ = stdinR.Close()
+		_ = stdinW.Close()
+	}()
+
+	return s, nil
+}
+
+const webIndexHTML = `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GO RUNCARNATION - WEB CONSOLE</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: #0b0f0b; color: #39ff14;
+    font-family: "Consolas", "SFMono-Regular", "Menlo", monospace;
+  }
+  #terminal {
+    white-space: pre-wrap;
+    word-break: break-word;
+    padding: 16px;
+    height: calc(100vh - 56px);
+    overflow-y: auto;
+    font-size: 13px;
+    line-height: 1.45;
+  }
+  #inputBar {
+    display: flex;
+    align-items: center;
+    border-top: 1px solid #1f4d1f;
+    padding: 10px 16px;
+    background: #050805;
+    height: 56px;
+  }
+  #prompt { color: #39ff14; margin-right: 8px; opacity: 0.8; }
+  #cmdInput {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: #39ff14;
+    font-family: inherit;
+    font-size: 14px;
+  }
+  #status { position: fixed; top: 8px; right: 12px; font-size: 11px; opacity: 0.6; }
+</style>
+</head>
+<body>
+  <div id="status">connecting...</div>
+  <div id="terminal"></div>
+  <div id="inputBar">
+    <span id="prompt">&gt;</span>
+    <input id="cmdInput" type="text" autocomplete="off" spellcheck="false" autofocus />
+  </div>
+<script>
+  const term = document.getElementById('terminal');
+  const input = document.getElementById('cmdInput');
+  const statusEl = document.getElementById('status');
+
+  function append(text) {
+    term.textContent += text;
+    term.scrollTop = term.scrollHeight;
+  }
+
+  const es = new EventSource('/stream');
+
+  es.onopen = () => { statusEl.textContent = 'connected'; };
+
+  es.onmessage = (e) => {
+    try {
+      append(JSON.parse(e.data));
+    } catch (err) {
+      append(e.data);
+    }
+  };
+
+  es.addEventListener('closed', () => {
+    // The shell itself exited (someone typed "exit"). Stop the
+    // EventSource so it doesn't auto-reconnect and silently start a
+    // brand new session behind the operator's back.
+    statusEl.textContent = 'session ended';
+    append('\n[session ended - reload the page to start a new one]\n');
+    input.disabled = true;
+    es.close();
+  });
+
+  es.onerror = () => {
+    // A dropped connection (tab backgrounded, network blip, etc.) does
+    // NOT end the underlying shell session - it just keeps running.
+    // EventSource retries automatically; once it reconnects it replays
+    // anything that was missed.
+    statusEl.textContent = 'reconnecting...';
+  };
+
+  input.addEventListener('keydown', async (ev) => {
+    if (ev.key !== 'Enter') return;
+
+    const line = input.value;
+    input.value = '';
+
+    try {
+      await fetch('/input', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ line })
+      });
+    } catch (err) {
+      append('\n[入力送信に失敗しました: ' + err + ']\n');
+    }
+  });
+
+  input.focus();
+</script>
+</body>
+</html>
+`
+
+func handleIndex(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = io.WriteString(w, webIndexHTML)
+}
+
+func writeSSEData(w io.Writer, payload string) {
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		encoded = []byte(strconv_Quote(payload))
+	}
+	fmt.Fprintf(w, "data: %s\n\n", encoded)
+}
+
+// strconv_Quote is a tiny fallback in case json.Marshal ever fails on a
+// plain string (it shouldn't), avoiding an extra import purely for a
+// near-impossible edge case.
+func strconv_Quote(s string) string {
+	return `"` + html.EscapeString(s) + `"`
+}
+
+func handleStream(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	s, err := getOrCreateSession()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+
+	ch, replay := s.hub.subscribe()
+	defer s.hub.unsubscribe(ch)
+
+	if len(replay) > 0 {
+		writeSSEData(w, string(replay))
+		flusher.Flush()
+	}
+
+	for {
+		select {
+
+		case data, ok := <-ch:
+			if !ok {
+				return
+			}
+			writeSSEData(w, string(data))
+			flusher.Flush()
+
+		case <-s.done:
+			// The shell itself exited (the "exit" command was typed).
+			// This is the only case where we tell the browser to stop.
+			fmt.Fprint(w, "event: closed\ndata: {}\n\n")
+			flusher.Flush()
+			return
+
+		case <-r.Context().Done():
+			// The browser disconnected. The session is left running
+			// untouched; a future /stream request will re-attach to it.
+			return
+		}
+	}
+}
+
+func handleInput(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var payload struct {
+		Line string `json:"line"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	// Typing into the input box implicitly (re)attaches to - or starts -
+	// the session, so input still works even if the SSE stream hasn't
+	// finished reconnecting yet.
+	s, err := getOrCreateSession()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if _, err := s.stdinW.Write([]byte(payload.Line + "\n")); err != nil {
+		http.Error(w, "failed to deliver input", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// openBrowser launches the OS's default web browser pointed at url.
+func openBrowser(url string) {
+	var cmd *exec.Cmd
+
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	case "darwin":
+		cmd = exec.Command("open", url)
+	default: // linux and other unix-likes
+		cmd = exec.Command("xdg-open", url)
+	}
+
+	_ = cmd.Start()
+}
+
+// startWebServer starts the embedded web console and blocks forever.
+func startWebServer() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", handleIndex)
+	mux.HandleFunc("/stream", handleStream)
+	mux.HandleFunc("/input", handleInput)
+
+	fmt.Println("[WEB] GO RUNCARNATION web console listening on", webListenAddr)
+	fmt.Println("[WEB] Open " + webBrowserURL + " in your browser (opening automatically)...")
+
+	if err := http.ListenAndServe(webListenAddr, mux); err != nil {
+		fmt.Println("[ERROR] Web server failed:", err)
+		os.Exit(1)
+	}
+}
+
+func main() {
+
+	// The web console plumbs its own os.Pipe()s for stdin/stdout. Writing to
+	// one of these after its read end has been closed (which happens
+	// routinely as sessions start and end) raises SIGPIPE; without this,
+	// the default disposition would silently kill the whole process. We'd
+	// rather just get an ordinary (and already-handled) write error.
+	signal.Ignore(syscall.SIGPIPE)
+
+	cleanupLogging, logErr := setupLogging()
+	if logErr != nil {
+		fmt.Println("[WARN] Logging could not be set up:", logErr)
+		cleanupLogging = func() {}
+	}
+
+	if len(os.Args) > 1 {
+		code := runNonInteractive(os.Args[1:])
+		cleanupLogging()
+		os.Exit(code)
+	}
+
+	defer cleanupLogging()
+
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		openBrowser(webBrowserURL)
+	}()
+
+	startWebServer()
 }
